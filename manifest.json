@@ -1,0 +1,9 @@
+{
+	"id": "vercel-deploy",
+	"name": "Vercel Deploy",
+	"version": "1.0.0",
+	"minAppVersion": "1.12.0",
+	"description": "Deploy the current folder as a static site to Vercel directly from Obsidian.",
+	"author": "Adam",
+	"isDesktopOnly": false
+}

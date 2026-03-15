@@ -1,0 +1,11 @@
+.vercel-deploy-success-title {
+	font-weight: var(--font-semibold);
+	margin-bottom: 6px;
+}
+
+.vercel-deploy-success-link {
+	color: var(--interactive-accent);
+	text-decoration: underline;
+	word-break: break-all;
+	cursor: pointer;
+}

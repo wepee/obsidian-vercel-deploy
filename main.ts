@@ -230,7 +230,29 @@ export default class VercelDeployPlugin extends Plugin {
 		}
 
 		const { id: deploymentId } = res.json;
+		await this.disableDeploymentProtection(projectName, token, teamId);
 		return this.pollUntilReady(deploymentId, projectName, token, teamId, notice);
+	}
+
+	async disableDeploymentProtection(
+		projectName: string,
+		token: string,
+		teamId: string,
+	): Promise<void> {
+		const qs = teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
+		await requestUrl({
+			url: `https://api.vercel.com/v9/projects/${encodeURIComponent(projectName)}${qs}`,
+			method: 'PATCH',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				passwordProtection: null,
+				ssoProtection: null,
+			}),
+			throw: false,
+		});
 	}
 
 	async pollUntilReady(

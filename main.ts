@@ -1,12 +1,16 @@
-import { App, Plugin, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
+import { App, Plugin, Notice, PluginSettingTab, Setting, TFile, normalizePath, requestUrl } from 'obsidian';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface VercelDeploySettings {
 	vercelToken: string;
 	teamId: string;
-	/** Map of vault folder paths → deployed URLs. */
-	deployedProjects: Record<string, string>;
+	/** Vercel project that hosts every share, one deployment per share. */
+	projectName: string;
+	/** Prepended to each share's subdomain: `<prefix><slug>.vercel.app`. */
+	subdomainPrefix: string;
+	/** Map of vault paths (folder or HTML file) → subdomain host. */
+	shares: Record<string, string>;
 }
 
 interface DeployFile {
@@ -15,16 +19,28 @@ interface DeployFile {
 	encoding: 'base64' | 'utf-8';
 }
 
+/** What gets deployed: a whole folder with its index.html, or one HTML file. */
+interface Share {
+	kind: 'folder' | 'file';
+	/** Vault path of the folder or file, used as the share's key. */
+	path: string;
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: VercelDeploySettings = {
 	vercelToken: '',
 	teamId: '',
-	deployedProjects: {},
+	projectName: 'second-brain',
+	subdomainPrefix: 'sb-',
+	shares: {},
 };
 
 const IGNORE_NAMES = new Set(['.DS_Store', 'node_modules', '.git', '.vercel', '.obsidian']);
 const IGNORE_EXTENSIONS = new Set(['.md', '.canvas', '.base']);
+
+// A DNS label is at most 63 characters.
+const MAX_SUBDOMAIN_LENGTH = 63;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -36,15 +52,70 @@ function shouldIgnore(name: string): boolean {
 	return false;
 }
 
-function sanitizeProjectName(name: string): string {
+function slugify(name: string): string {
 	return name
 		.toLowerCase()
-		// Strip emojis and symbols outside basic Latin
+		.normalize('NFD')
+		// Strip accents, then emojis and symbols outside basic Latin
+		.replace(/[̀-ͯ]/g, '')
 		.replace(/[\u{1F000}-\u{1FFFF}]|[\u{2600}-\u{27BF}]|[\u{FE00}-\u{FEFF}]|[\u{200D}\u{20E3}\u{FE0F}]/gu, '')
 		.replace(/[^a-z0-9-]/g, '-')
 		.replace(/-+/g, '-')
-		.replace(/^-|-$/g, '')
-		.substring(0, 52) || 'untitled';
+		.replace(/^-|-$/g, '') || 'untitled';
+}
+
+function subdomainFor(prefix: string, slug: string): string {
+	return `${prefix}${slug}`
+		.substring(0, MAX_SUBDOMAIN_LENGTH)
+		.replace(/-+$/, '');
+}
+
+/** Short stable hash, used to disambiguate a subdomain already taken. */
+function shortHash(value: string): string {
+	let h = 0;
+	for (let i = 0; i < value.length; i++) {
+		h = (Math.imul(31, h) + value.charCodeAt(i)) | 0;
+	}
+	return (h >>> 0).toString(36).slice(0, 5);
+}
+
+function parentPath(path: string): string {
+	const i = path.lastIndexOf('/');
+	return i === -1 ? '' : path.slice(0, i);
+}
+
+/** Resolves `relative` against `base`; null when it climbs out of the vault. */
+function resolveRelative(base: string, relative: string): string | null {
+	const parts = base ? base.split('/') : [];
+	for (const segment of relative.split('/')) {
+		if (segment === '' || segment === '.') continue;
+		if (segment === '..') {
+			if (parts.length === 0) return null;
+			parts.pop();
+		} else {
+			parts.push(segment);
+		}
+	}
+	return parts.join('/');
+}
+
+/** Local paths an HTML page links to (src, href, poster), without query or hash. */
+function localReferences(html: string): string[] {
+	const refs = new Set<string>();
+	const pattern = /(?:src|href|poster)\s*=\s*["']([^"']+)["']/gi;
+	let match;
+	while ((match = pattern.exec(html)) !== null) {
+		const raw = match[1].trim();
+		if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|\/|#)/i.test(raw)) continue;
+		const path = raw.split(/[?#]/)[0];
+		if (!path) continue;
+		try {
+			refs.add(decodeURIComponent(path));
+		} catch {
+			refs.add(path);
+		}
+	}
+	return [...refs];
 }
 
 /** Web-compatible base64 encoding (no Node.js Buffer needed → works on mobile). */
@@ -71,8 +142,8 @@ export default class VercelDeployPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'deploy-active-folder',
-			name: 'Deploy active folder to Vercel',
-			callback: () => this.deployActiveFolder(),
+			name: 'Share on Vercel',
+			callback: () => this.deployActive(),
 		});
 
 		this.addSettingTab(new VercelDeploySettingTab(this.app, this));
@@ -80,10 +151,10 @@ export default class VercelDeployPlugin extends Plugin {
 
 	// ── Deploy flow ──────────────────────────────────────────────────────────
 
-	async deployActiveFolder() {
+	async deployActive() {
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
-			new Notice('Open a note inside the folder to deploy.');
+			new Notice('Open an HTML file, or a note inside the folder to share.');
 			return;
 		}
 
@@ -92,30 +163,19 @@ export default class VercelDeployPlugin extends Plugin {
 			return;
 		}
 
-		const folder = activeFile.parent;
-		const folderVaultPath = folder ? folder.path : '/';
-		const folderPath = folder ? folder.path : this.app.vault.getName();
-		const projectName = sanitizeProjectName(folderPath);
+		const share = await this.resolveShare(activeFile);
+		if (!share) return;
 
-		// Guard: a valid static site needs an index.html
-		const indexPath = folderVaultPath === '/'
-			? 'index.html'
-			: `${folderVaultPath}/index.html`;
-
-		const hasIndex = await this.app.vault.adapter.exists(indexPath);
-		if (!hasIndex) {
-			new Notice(`No index.html found in "${folderPath}".`);
-			return;
-		}
-
-		const notice = new Notice(`Collecting files from "${folderPath}"…`, 0);
+		const notice = new Notice(`Collecting files from "${share.path}"…`, 0);
 
 		try {
-			const files = await this.collectFiles(folderVaultPath);
+			const files = share.kind === 'folder'
+				? await this.collectFiles(share.path)
+				: await this.collectHtmlFile(share.path);
 
 			if (files.length === 0) {
 				notice.hide();
-				new Notice('No web files found in this folder.');
+				new Notice('No web files found to share.');
 				return;
 			}
 
@@ -131,20 +191,51 @@ export default class VercelDeployPlugin extends Plugin {
 				encoding: 'base64',
 			});
 
-			notice.setMessage(`Deploying ${files.length} file(s) to ${projectName}.vercel.app…`);
+			notice.setMessage(`Deploying ${files.length} file(s) to ${this.settings.projectName}…`);
 
-			const deployedUrl = await this.deploy(projectName, files, notice);
+			const deploymentId = await this.deploy(files);
+			await this.pollUntilReady(deploymentId, notice);
 
-			// Track the successful deployment
-			this.settings.deployedProjects[folderPath] = deployedUrl;
+			notice.setMessage('Assigning the share URL…');
+			const host = await this.assignShareAlias(share, deploymentId);
+
+			this.settings.shares[share.path] = host;
 			await this.saveSettings();
 
 			notice.hide();
-			this.showSuccessNotice(deployedUrl, projectName);
+			this.showSuccessNotice(`https://${host}`, share.path);
 		} catch (err) {
 			notice.hide();
 			new Notice(`Deploy failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	/**
+	 * An HTML file other than index.html is shared on its own. Anything else
+	 * shares its folder, which needs an index.html — or a single HTML file,
+	 * shared on its own.
+	 */
+	async resolveShare(activeFile: TFile): Promise<Share | null> {
+		if (activeFile.extension === 'html' && activeFile.name !== 'index.html') {
+			return { kind: 'file', path: activeFile.path };
+		}
+
+		const folderPath = activeFile.parent?.path ?? '/';
+		const indexPath = folderPath === '/' ? 'index.html' : `${folderPath}/index.html`;
+		if (await this.app.vault.adapter.exists(indexPath)) {
+			return { kind: 'folder', path: folderPath };
+		}
+
+		const listing = await this.app.vault.adapter.list(folderPath === '/' ? '' : folderPath);
+		const htmlFiles = listing.files.filter(f => f.toLowerCase().endsWith('.html'));
+		if (htmlFiles.length === 1) {
+			return { kind: 'file', path: htmlFiles[0] };
+		}
+
+		new Notice(htmlFiles.length === 0
+			? `No HTML file found in "${folderPath}".`
+			: `Several HTML files in "${folderPath}": open the one to share.`);
+		return null;
 	}
 
 	// ── File collection ──────────────────────────────────────────────────────
@@ -195,33 +286,83 @@ export default class VercelDeployPlugin extends Plugin {
 		return files;
 	}
 
+	/**
+	 * One HTML file, served at the root of its share under its own name too,
+	 * plus the local files it links to (images, CSS, scripts, other pages).
+	 * The rest of its folder stays private.
+	 */
+	async collectHtmlFile(htmlPath: string): Promise<DeployFile[]> {
+		const adapter = this.app.vault.adapter;
+		const baseFolder = parentPath(htmlPath);
+		const html = await adapter.read(htmlPath);
+		const data = arrayBufferToBase64(await adapter.readBinary(htmlPath));
+		const fileName = htmlPath.split('/').pop()!;
+
+		const files: DeployFile[] = [{ file: 'index.html', data, encoding: 'base64' }];
+		const deployed = new Set(['index.html']);
+		if (fileName !== 'index.html') {
+			files.push({ file: fileName, data, encoding: 'base64' });
+			deployed.add(fileName);
+		}
+
+		for (const ref of localReferences(html)) {
+			const deployPath = resolveRelative('', ref);
+			const vaultPath = resolveRelative(baseFolder, ref);
+			if (!deployPath || vaultPath === null || deployed.has(deployPath)) continue;
+			if (deployPath.split('/').some(shouldIgnore)) continue;
+
+			const stat = await adapter.stat(normalizePath(vaultPath));
+			if (stat?.type !== 'file') continue;
+
+			files.push({
+				file: deployPath,
+				data: arrayBufferToBase64(await adapter.readBinary(normalizePath(vaultPath))),
+				encoding: 'base64',
+			});
+			deployed.add(deployPath);
+		}
+
+		return files;
+	}
+
 	// ── Vercel API ───────────────────────────────────────────────────────────
 
-	async deploy(projectName: string, files: DeployFile[], notice: Notice): Promise<string> {
-		const { vercelToken: token, teamId } = this.settings;
-		const qs = teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
+	private get teamQuery(): string {
+		const { teamId } = this.settings;
+		return teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
+	}
 
-		const body = {
+	private async api(method: string, path: string, body?: unknown) {
+		return requestUrl({
+			url: `https://api.vercel.com${path}${this.teamQuery}`,
+			method,
+			headers: {
+				Authorization: `Bearer ${this.settings.vercelToken}`,
+				'Content-Type': 'application/json',
+			},
+			body: body === undefined ? undefined : JSON.stringify(body),
+			throw: false,
+		});
+	}
+
+	/**
+	 * Creates a preview deployment in the shared project. Previews carrying a
+	 * custom alias are exempt from Vercel's retention policy, so a share stays
+	 * up for as long as its alias points to it.
+	 */
+	async deploy(files: DeployFile[]): Promise<string> {
+		const { projectName } = this.settings;
+
+		const res = await this.api('POST', '/v13/deployments', {
 			name: projectName,
+			project: projectName,
 			files,
-			target: 'production',
 			projectSettings: {
 				framework: null,
 				outputDirectory: null,
 				installCommand: null,
 				buildCommand: null,
 			},
-		};
-
-		const res = await requestUrl({
-			url: `https://api.vercel.com/v13/deployments${qs}`,
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${token}`,
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify(body),
-			throw: false,
 		});
 
 		if (res.status >= 400) {
@@ -229,78 +370,78 @@ export default class VercelDeployPlugin extends Plugin {
 			throw new Error(msg);
 		}
 
-		const { id: deploymentId } = res.json;
-		await this.disableDeploymentProtection(projectName, token, teamId);
-		return this.pollUntilReady(deploymentId, projectName, token, teamId, notice);
+		await this.disableDeploymentProtection();
+		return res.json.id;
 	}
 
-	async disableDeploymentProtection(
-		projectName: string,
-		token: string,
-		teamId: string,
-	): Promise<void> {
-		const qs = teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
-		await requestUrl({
-			url: `https://api.vercel.com/v9/projects/${encodeURIComponent(projectName)}${qs}`,
-			method: 'PATCH',
-			headers: {
-				Authorization: `Bearer ${token}`,
-				'Content-Type': 'application/json',
-			},
-			body: JSON.stringify({
-				passwordProtection: null,
-				ssoProtection: null,
-			}),
-			throw: false,
+	async disableDeploymentProtection(): Promise<void> {
+		await this.api('PATCH', `/v9/projects/${encodeURIComponent(this.settings.projectName)}`, {
+			passwordProtection: null,
+			ssoProtection: null,
 		});
 	}
 
-	async pollUntilReady(
-		deploymentId: string,
-		projectName: string,
-		token: string,
-		teamId: string,
-		notice: Notice,
-	): Promise<string> {
-		const qs = teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
+	async pollUntilReady(deploymentId: string, notice: Notice): Promise<void> {
 		const maxAttempts = 90; // ~3 min
 
 		for (let i = 0; i < maxAttempts; i++) {
 			await sleep(2000);
 
-			const res = await requestUrl({
-				url: `https://api.vercel.com/v13/deployments/${deploymentId}${qs}`,
-				method: 'GET',
-				headers: { Authorization: `Bearer ${token}` },
-				throw: false,
-			});
-
+			const res = await this.api('GET', `/v13/deployments/${deploymentId}`);
 			if (res.status >= 400) continue;
 
-			const { readyState, alias, url } = res.json;
+			const { readyState } = res.json;
 			notice.setMessage(`Deploying… (${readyState})`);
 
-			if (readyState === 'READY') {
-				return alias?.length
-					? `https://${alias[0]}`
-					: `https://${url}`;
-			}
-
+			if (readyState === 'READY') return;
 			if (readyState === 'ERROR' || readyState === 'CANCELED') {
 				throw new Error(`Deployment failed (${readyState}).`);
 			}
 		}
 
-		return `https://${projectName}.vercel.app`;
+		throw new Error('Deployment still not ready after 3 minutes.');
+	}
+
+	/**
+	 * Points the share's subdomain at the new deployment. A share keeps the
+	 * subdomain it got the first time; a new one is derived from its vault
+	 * path, with a short hash appended if someone else already owns it.
+	 */
+	async assignShareAlias(share: Share, deploymentId: string): Promise<string> {
+		const known = this.settings.shares[share.path];
+		const slug = slugify(share.kind === 'file'
+			? share.path.replace(/\.html$/i, '')
+			: share.path);
+		const base = subdomainFor(this.settings.subdomainPrefix, slug);
+		const hashed = subdomainFor(
+			this.settings.subdomainPrefix,
+			`${slug.substring(0, MAX_SUBDOMAIN_LENGTH - this.settings.subdomainPrefix.length - 6)}-${shortHash(share.path)}`,
+		);
+		const takenByOtherShare = (host: string) => Object.entries(this.settings.shares)
+			.some(([path, h]) => h === host && path !== share.path);
+
+		const candidates = known
+			? [known]
+			: [`${base}.vercel.app`, `${hashed}.vercel.app`].filter(h => !takenByOtherShare(h));
+
+		let lastError = 'no subdomain available';
+		for (const host of candidates) {
+			const res = await this.api('POST', `/v2/deployments/${deploymentId}/aliases`, { alias: host });
+			if (res.status < 400 || res.json?.error?.code === 'not_modified') return host;
+			lastError = res.json?.error?.message || `HTTP ${res.status}`;
+		}
+		throw new Error(`Could not assign the share URL: ${lastError}`);
 	}
 
 	// ── Success notice ───────────────────────────────────────────────────────
 
-	showSuccessNotice(url: string, projectName: string) {
+	showSuccessNotice(url: string, sharePath: string) {
+		navigator.clipboard?.writeText(url).catch(() => { /* clipboard unavailable */ });
+
 		const frag = document.createDocumentFragment();
 
 		const title = createDiv({ cls: 'vercel-deploy-success-title' });
-		title.textContent = `"${projectName}" is live!`;
+		title.textContent = `"${sharePath}" is live! Link copied.`;
 		frag.appendChild(title);
 
 		const link = createEl('a', { cls: 'vercel-deploy-success-link', href: url });
@@ -317,7 +458,11 @@ export default class VercelDeployPlugin extends Plugin {
 	// ── Settings persistence ─────────────────────────────────────────────────
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const data = await this.loadData() ?? {};
+		// Folder → URL map from the one-project-per-folder era; those projects are gone
+		delete data.deployedProjects;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+		this.settings.shares = { ...this.settings.shares };
 	}
 
 	async saveSettings() {
@@ -366,6 +511,28 @@ class VercelDeploySettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.teamId)
 				.onChange(async (value) => {
 					this.plugin.settings.teamId = value.trim();
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Project')
+			.setDesc('Vercel project that hosts every share, one deployment each.')
+			.addText(text => text
+				.setPlaceholder(DEFAULT_SETTINGS.projectName)
+				.setValue(this.plugin.settings.projectName)
+				.onChange(async (value) => {
+					this.plugin.settings.projectName = value.trim() || DEFAULT_SETTINGS.projectName;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Subdomain prefix')
+			.setDesc('Each share lives at <prefix><vault path>.vercel.app.')
+			.addText(text => text
+				.setPlaceholder(DEFAULT_SETTINGS.subdomainPrefix)
+				.setValue(this.plugin.settings.subdomainPrefix)
+				.onChange(async (value) => {
+					this.plugin.settings.subdomainPrefix = slugify(value) === 'untitled' ? '' : `${slugify(value)}-`;
 					await this.plugin.saveSettings();
 				}));
 

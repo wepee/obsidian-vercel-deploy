@@ -1,7 +1,7 @@
 {
 	"name": "obsidian-vercel-deploy",
-	"version": "1.0.0",
-	"description": "Deploy the current folder as a static site to Vercel directly from Obsidian.",
+	"version": "1.1.0",
+	"description": "Share HTML files and folders from Obsidian on Vercel, all in one project, one subdomain per share.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
